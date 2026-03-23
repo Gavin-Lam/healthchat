@@ -4,58 +4,240 @@ from pymongo import MongoClient
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
 from dotenv import load_dotenv
-import google.generativeai as genai
 from bson import ObjectId
 import random
-import os 
+import os
 from flask_socketio import SocketIO, emit
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
-from emotion_detector import EmotionDetector
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from flask import Response
+from prometheus_flask_exporter import PrometheusMetrics
+from prometheus_client import REGISTRY
+from functools import wraps
 
+# ── LangChain ────────────────────────────────────────────────────────────────
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain.memory import ConversationBufferWindowMemory
+from langchain.prompts import PromptTemplate
+from langchain.tools import Tool
+from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+load_dotenv()
+
+# ── Flask + extensions ────────────────────────────────────────────────────────
 app = Flask(__name__)
+metrics = PrometheusMetrics(app)
 
-socketio = SocketIO(app)
-dt = datetime.today()
-TODAY = dt.strftime('%A').lower()
+# ── Prometheus counters (safe re-registration) ────────────────────────────────
+def _get_or_create_counter(name, description, labels=None):
+    if name not in REGISTRY._names_to_collectors:
+        return Counter(name, description, labels or [])
+    return REGISTRY._names_to_collectors[name]
+
+def _get_or_create_histogram(name, description, labels=None):
+    if name not in REGISTRY._names_to_collectors:
+        return Histogram(name, description, labels or [])
+    return REGISTRY._names_to_collectors[name]
+
+REQUEST_COUNT   = _get_or_create_counter('ava_request_count',           'Total HTTP requests',                    ['method', 'endpoint'])
+REQUEST_LATENCY = _get_or_create_histogram('ava_request_latency_seconds','Latency of HTTP requests in seconds',   ['endpoint'])
+REMINDER_SAVED  = _get_or_create_counter('ava_reminder_saved_total',    'Total reminders saved')
+
+def track_metrics(endpoint_name):
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            start = time.time()
+            REQUEST_COUNT.labels(method=request.method, endpoint=endpoint_name).inc()
+            response = f(*args, **kwargs)
+            REQUEST_LATENCY.labels(endpoint=endpoint_name).observe(time.time() - start)
+            return response
+        return wrapper
+    return decorator
+
+socketio  = SocketIO(app)
+dt        = datetime.today()
+TODAY     = dt.strftime('%A').lower()
 scheduler = BackgroundScheduler()
 scheduler.start()
 
+app.secret_key = os.getenv("SECRET_KEY", "test-secret-key")
+
+# ── MongoDB ───────────────────────────────────────────────────────────────────
+MONGO_URI = os.getenv("MONGO_URI")
+if MONGO_URI:
+    mongo_client     = MongoClient(MONGO_URI)
+    db               = mongo_client["test"]
+    users_collection = db["users"]
+else:
+    mongo_client     = None
+    db               = None
+    users_collection = None
+
+if users_collection is None:
+    class DummyInsertResult:
+        def __init__(self, inserted_id): self.inserted_id = inserted_id
+
+    class DummyUpdateResult:
+        def __init__(self, matched_count): self.matched_count = matched_count
+
+    class DummyCollection:
+        def __init__(self): self.storage = []
+
+        def find_one(self, query):
+            for doc in self.storage:
+                if all(doc.get(k) == v for k, v in query.items()):
+                    return doc
+            return None
+
+        def insert_one(self, doc):
+            doc["_id"] = ObjectId()
+            self.storage.append(doc)
+            return DummyInsertResult(doc["_id"])
+
+        def update_one(self, query, update):
+            doc = self.find_one(query)
+            if not doc:
+                return DummyUpdateResult(0)
+            if "$push" in update:
+                for k, v in update["$push"].items():
+                    doc.setdefault(k, [])
+                    if isinstance(v, dict) and "$each" in v:
+                        doc[k].extend(v["$each"])
+                    else:
+                        doc[k].append(v)
+            return DummyUpdateResult(1)
+
+        def delete_one(self, query):
+            self.storage = [d for d in self.storage
+                            if not all(d.get(k) == v for k, v in query.items())]
+            return None
+
+    users_collection = DummyCollection()
 
 
-load_dotenv()
-app.secret_key = os.getenv("SECRET_KEY")
+# ── LangChain agent factory ───────────────────────────────────────────────────
 
-# MongoDB Connection
-client = MongoClient(os.getenv("MONGO_URI"))
-db = client.test 
+REACT_PROMPT = PromptTemplate.from_template(
+    """You are AVA, a compassionate and knowledgeable mental health and health assistant.
+Your role is to listen to the user's emotional concerns and provide supportive advice.
+Act as a friend or caretaker. Use simple, everyday language and keep a conversational tone.
+Avoid technical terms. At the end of each response, ask a specific follow-up question
+related to the user's health or well-being. Use strictly 1-2 short sentences (max 50 words).
+You are NOT a substitute for a real doctor – always remind users to seek professional
+care for serious concerns.
 
-# Initialize Google Generative AI
-# Set the API key for google.generativeai
-genai.configure(api_key=os.getenv("API_KEY"))
+You have access to the following tools:
 
-users_collection = db.users 
+{tools}
 
-#model = genai.GenerativeModel(model_name="gemini-1.5-flash")
-#model = genai.GenerativeModel(model_name="tunedModels/avamentalhealthft1-23b1qsi4o8g0")
-model = genai.GenerativeModel(model_name="tunedModels/mentalhealthchatbot-7mrtrsg0fib1")
-chat_object = model.start_chat()
+Use the following format EXACTLY:
 
-@app.route('/chatbot')
-def chatbot():
-    return render_template('chatbot.html')
+Question: the input question you must answer
+Thought: think about what to do
+Action: the action to take, must be one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat up to 3 times)
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
 
-@app.route('/')
-def index():
-    return redirect(url_for('login'))
+Previous conversation:
+{chat_history}
 
-@app.route('/reminders')
-def reminders():
-    return render_template('reminders.html')
+Question: {input}
+Thought:{agent_scratchpad}"""
+)
 
-#Helper Function to process the message data
+# One agent executor per logged-in user, keyed by user_id string.
+# This keeps each user's LangChain memory completely separate.
+_user_agents: dict[str, AgentExecutor] = {}
+
+
+def _build_agent_executor(chat_history: list) -> AgentExecutor:
+    """
+    Build a fresh AgentExecutor pre-seeded with the user's MongoDB chat history
+    so memory survives server restarts as long as history is in the DB.
+    """
+    api_key = os.getenv("API_KEY")
+    if not api_key:
+        raise EnvironmentError("API_KEY is not set in .env")
+
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        google_api_key=api_key,
+        temperature=0.4,
+        convert_system_message_to_human=True,
+    )
+
+    search = DuckDuckGoSearchRun()
+    tools = [
+        Tool(
+            name="web_search",
+            func=search.run,
+            description=(
+                "Search the internet for current health information such as symptoms, "
+                "conditions, treatments, medications, or mental health resources. "
+                "Use this when the user asks something that needs up-to-date factual "
+                "medical or health knowledge. Input must be a plain-English search query."
+            ),
+        )
+    ]
+
+    # Seed LangChain memory from MongoDB so context carries across restarts
+    memory = ConversationBufferWindowMemory(
+        memory_key="chat_history",
+        k=10,
+        return_messages=False,
+    )
+    for msg in chat_history[-20:]:   # seed with last 20 stored messages
+        role    = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "user":
+            memory.chat_memory.add_user_message(content)
+        elif role == "bot":
+            memory.chat_memory.add_ai_message(content)
+
+    agent = create_react_agent(llm=llm, tools=tools, prompt=REACT_PROMPT)
+    return AgentExecutor(
+        agent=agent,
+        tools=tools,
+        memory=memory,
+        verbose=True,
+        handle_parsing_errors=True,
+        max_iterations=4,
+    )
+
+
+def get_agent_executor() -> AgentExecutor:
+    """
+    Return (or lazily create) the AgentExecutor for the current user.
+    Raises ValueError if no user is logged in.
+    """
+    user_id = session.get("user_id")
+    if not user_id:
+        raise ValueError("User not logged in.")
+
+    if user_id not in _user_agents:
+        # Load existing chat history from DB to seed memory
+        user = users_collection.find_one({"_id": ObjectId(user_id)})
+        history = user.get("chat_history", []) if user else []
+        _user_agents[user_id] = _build_agent_executor(history)
+
+    return _user_agents[user_id]
+
+
+def _evict_agent(user_id: str):
+    """Remove a user's agent from the cache (call on logout)."""
+    _user_agents.pop(user_id, None)
+
+
+# ── Helper functions ──────────────────────────────────────────────────────────
+
 def process_messages(messages):
     return [
         {
@@ -66,7 +248,6 @@ def process_messages(messages):
         for msg in messages
     ]
 
-#Helper Function to get current user's ID from the session
 def get_user_id():
     user_id = session.get('user_id')
     if not user_id:
@@ -80,95 +261,92 @@ def get_chat_history():
         return user["chat_history"]
     return []
 
-def model_with_history():
-    chat_history = get_chat_history()
-    # for new users, the chat history will be empty. 
-    if not chat_history:
-        initial_prompts = [
-            "Hey there! How are you feeling today?", "Hi! I'm here for you. What’s on your mind?",
-            "Hello! How’s everything going for you today?", "Hey! I’m ready to listen. How are you feeling?",
-            "Hi there! How are you doing, both physically and mentally?", "Hello! What’s something you’d like to talk about today?",
-            "Hi! How’s your day been so far?", "Hey! It’s good to see you. How are you holding up?",
-            "Hello! How can I support you today?", "Hi! What’s been on your mind lately?",
-            "Hey! I’m here to help you feel better. How are you?", "Hi! I’d love to hear how you’re doing today.",
-            "Hello! Is there anything on your mind that you'd like to share?", "Hey! How’s your mood today?",
-            "Hi there! How are you feeling emotionally today?", "Hello! It’s great to see you. How’s everything going for you?",
-            "Hi! How are you feeling in this moment?", "Hey! I’m here if you need someone to talk to. How are you?",
-            "Hello! How’s your mental health been lately?", "Hi! Let’s chat. How are you feeling today?",
-            "Hey! How’s your headspace today? Need a little support?", "Hello! What’s something on your mind that we can talk about?",
-            "Hi there! How are things going for you today?", "Hey! How are you really feeling today?",
-            "Hello! How has your week been so far?", "Hi! Anything on your mind that you’d like to talk about?",
-            "Hey! How can I be helpful to you today?", "Hi there! How’s your emotional well-being right now?"
-        ]
-        random_prompt = random.choice(initial_prompts)
-        print(f"Selected initial prompt: {random_prompt}") 
-        return f"Bot: {random_prompt}"
-    
-    #otherwise, i built the prompt with existing chat history. 
-    prompt_history = ""
-    for msg in chat_history:
-        role = msg["role"]
-        content = msg["content"]
-        prompt_history += f"{role.capitalize()}: {content}\n"
 
-    guidance_prompt = (
-            "As A.V.A, a mental health assistant, review the chat history and craft a brief, empathetic response. "
-            "Ask a concise, caring follow-up question directly related to the user's previous messages. Use exactly 1-2 short sentences."
-    )
+# ── Routes ────────────────────────────────────────────────────────────────────
 
-    initial_prompt = f"{guidance_prompt}\n\n{prompt_history}Bot:"
-    return initial_prompt
-   
+@app.route('/chatbot')
+def chatbot():
+    return render_template('chatbot.html')
+
+@app.route('/')
+def index():
+    return redirect(url_for('login'))
+
+@app.route('/reminders')
+def reminders():
+    return render_template('reminders.html')
+
 
 @app.route('/api/initChat', methods=['POST'])
 def init_chat():
+    """
+    Called when the chatbot page loads.
+    Returns a greeting – either a random opener for new users or a
+    context-aware follow-up for returning users.
+    """
     try:
-        prompt = model_with_history()
         chat_history = get_chat_history()
+
         if not chat_history:
-            bot_response = prompt.replace("Bot: ", "")
+            initial_prompts = [
+                "Hey there! How are you feeling today?",
+                "Hi! I'm here for you. What's on your mind?",
+                "Hello! How's everything going for you today?",
+                "Hey! I'm ready to listen. How are you feeling?",
+                "Hi there! How are you doing, both physically and mentally?",
+                "Hello! What's something you'd like to talk about today?",
+                "Hi! How's your day been so far?",
+                "Hey! It's good to see you. How are you holding up?",
+                "Hello! How can I support you today?",
+                "Hi! What's been on your mind lately?",
+            ]
+            bot_response = random.choice(initial_prompts)
         else:
-            result = chat_object.send_message(prompt)
-            follow_up_question = " Would you like to continue talking about this, or is there something new you'd like to discuss today?"
-            bot_response = result.text + follow_up_question
+            # Build a short history string and ask the agent for a warm follow-up
+            recent = chat_history[-6:]
+            history_str = "\n".join(
+                f"{m['role'].capitalize()}: {m['content']}" for m in recent
+            )
+            prompt = (
+                "As AVA, a mental health assistant, review the recent chat history "
+                "and craft a brief, empathetic follow-up greeting for the user's return. "
+                "Use exactly 1-2 short sentences.\n\n"
+                f"{history_str}"
+            )
+            agent = get_agent_executor()
+            result = agent.invoke({"input": prompt})
+            bot_response = result["output"]
+            bot_response += " Would you like to continue talking about this, or is there something new on your mind?"
+
         return jsonify({"reply": bot_response})
+
     except Exception as error:
         print("Error generating initial response:", error)
         return jsonify({"error": "Error generating initial response"}), 500
 
-@app.route('/api/chat', methods=['POST'])
-def chat():
-    data = request.json
-    user_input = data.get('input')
-    user_id = data.get('userId')
 
-    prompt = f"""You are a compassionate and knowledgeable mental health assistant. Your role is to listen to the user’s emotional concerns and 
-    provide supportive advice. Act as a friend or caretaker to the user. Use simple, everyday language to keep things easy to understand. Make 
-    sure your tone is conversational, and avoid technical terms or complex phrases. At the end ask a specific follow-up question related to their 
-    health or well-being. Keep your question friendly and focused on keeping the conversation going in a positive, engaging way. Provide the best 
-    course of action based on this input: {user_input}. Use strictly just 1-2 short sentences [max 50 words]"""
+@app.route('/api/chat', methods=['POST'])
+@track_metrics("api_chat")
+def chat():
+    data       = request.json
+    user_input = data.get('input', '')
+    user_id    = data.get('userId')
 
     try:
-        result = chat_object.send_message(prompt)
-        bot_response = result.text
+        agent      = get_agent_executor()
+        result     = agent.invoke({"input": user_input})
+        bot_response = result["output"]
 
+        # Persist both sides of the exchange to MongoDB
         if user_id:
             try:
                 users_collection.update_one(
                     {'_id': ObjectId(user_id)},
                     {'$push': {
-                        'chat_history': [
-                            {
-                                'role': 'user',
-                                'content': user_input,
-                                'timestamp': datetime.now()
-                            },
-                            {
-                                'role': 'bot',
-                                'content': bot_response,
-                                'timestamp': datetime.now()
-                            },
-                        ],
+                        'chat_history': {'$each': [
+                            {'role': 'user', 'content': user_input,    'timestamp': datetime.now()},
+                            {'role': 'bot',  'content': bot_response,  'timestamp': datetime.now()},
+                        ]}
                     }}
                 )
                 print("Chat history saved successfully.")
@@ -176,131 +354,130 @@ def chat():
                 print("Database error:", db_error)
 
         return jsonify({"reply": bot_response})
+
     except Exception as error:
         print("Error generating response:", error)
         return jsonify({"error": "Error generating response"}), 500
-    
-    
+
+
 @app.route('/save_history', methods=['POST'])
 def save_history():
     if request.method == 'POST' and request.is_json:
-        data = request.get_json() 
-
+        data = request.get_json()
         if 'messages' not in data:
             return jsonify({"error": "'messages' field is required."}), 400
-        
-        messages = data['messages']
-
         try:
-            formatted_messages = process_messages(messages)
+            formatted_messages = process_messages(data['messages'])
             user_id = get_user_id()
-            
-            result = users_collection.update_one(
+            result  = users_collection.update_one(
                 {'_id': user_id},
-                {'$push': {
-                    'chat_history': {'$each': formatted_messages}
-                }}
+                {'$push': {'chat_history': {'$each': formatted_messages}}}
             )
-
             if result.matched_count == 0:
                 return jsonify({"error": "User not found."}), 404
-
             return jsonify({"message": "Chat history updated successfully"}), 200
-        
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
-        
+
+
 def send_reminder(reminder):
     socketio.emit('reminder', reminder)
+
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
-        
-        user = users_collection.find_one({"username": username})
-        
+        user     = users_collection.find_one({"username": username})
+
         if user and check_password_hash(user["password"], password):
             session['user_id'] = str(user["_id"])
             flash("Login successful!")
 
             if user.get('reminders'):
-                reminders = user['reminders']
-                for reminder in reminders:
+                for reminder in user['reminders']:
                     day = reminder['day'].lower()
                     if day == TODAY:
                         now = datetime.now()
-                        time = reminder['time']
+                        t   = reminder['time']
                         reminder_datetime = datetime.combine(
-                            now.date(), 
-                            datetime.strptime(time, "%H:%M").time()
+                            now.date(),
+                            datetime.strptime(t, "%H:%M").time()
                         )
-
                         scheduler.add_job(
                             send_reminder,
                             trigger=DateTrigger(run_date=reminder_datetime),
                             args=[reminder],
                         )
-
             return redirect(url_for('chatbot'))
         else:
             flash("Invalid username or password")
             return render_template('login.html')
     return render_template('login.html')
 
+
 @app.route('/signup', methods=['GET', 'POST'])
 def signup():
     if request.method == 'POST':
-        username = request.form['username']
+        username  = request.form['username']
         password1 = request.form['password1']
         password2 = request.form['password2']
-        
-        user = users_collection.find_one({"username": username})
+        user      = users_collection.find_one({"username": username})
 
         if user is None:
             if password1 != password2:
                 flash("Passwords do not match")
                 return redirect(url_for('signup'))
-            new_user = {"username": username, "password": generate_password_hash(password1), "chat_history": [], "reminders": []}
+            new_user = {
+                "username":     username,
+                "password":     generate_password_hash(password1),
+                "chat_history": [],
+                "reminders":    [],
+            }
             users_collection.insert_one(new_user)
             session['user_id'] = str(new_user["_id"])
             return redirect(url_for('chatbot'))
-        
         else:
             flash("Username is taken.")
             return redirect(url_for('signup'))
-    
     return render_template('signup.html')
-        
+
+
 @app.route('/logout')
 def logout():
-    session.pop('user_id', None)
+    user_id = session.pop('user_id', None)
+    if user_id:
+        _evict_agent(user_id)   # free the agent's memory on logout
     scheduler.remove_all_jobs()
     flash("Logged out successfully")
     return render_template('login.html')
+
 
 @app.route('/send_messages', methods=['POST'])
 def send_messages():
     if 'user_id' not in session:
         return redirect(url_for('login'))
-    
+
     user_id = session['user_id']
     message = request.form.get('message')
-
     if not message:
         return jsonify({"error": "Message cannot be empty"}), 400
-    
-    # Save message to the user's chat history
+
     save_to_chat_history(user_id, message)
-    
-    bot_response = generate_bot_response()
+
+    try:
+        agent        = get_agent_executor()
+        result       = agent.invoke({"input": message})
+        bot_response = result["output"]
+    except Exception as e:
+        print("Agent error:", e)
+        bot_response = "I'm sorry, I ran into a problem. Please try again."
 
     save_to_chat_history(user_id, bot_response)
-
     return jsonify({"reply": bot_response})
 
-#Helper function to save messages to the database.
+
 def save_to_chat_history(user_id, message):
     timestamp = datetime.now()
     users_collection.update_one(
@@ -308,30 +485,31 @@ def save_to_chat_history(user_id, message):
         {"$push": {"chat_history": {"message": message, "timestamp": timestamp}}}
     )
 
+
 @app.route('/save_reminder', methods=['POST'])
+@track_metrics("save_reminder")
 def save_reminder():
     user_id = session['user_id']
-    data = request.get_json() 
-    day = data['day'].lower()
-    time = data['time']
+    data    = request.get_json()
+    day     = data['day'].lower()
+    t       = data['time']
 
     users_collection.update_one(
         {"_id": ObjectId(user_id)},
-        {"$push": {
-            "reminders": {
-              "text": data['text'], 
-              "time": time,
-              "day": day, 
-              "frequency": data['frequency'], 
-            }}}
+        {"$push": {"reminders": {
+            "text":      data['text'],
+            "time":      t,
+            "day":       day,
+            "frequency": data['frequency'],
+        }}}
     )
+
     if day == TODAY:
         now = datetime.now()
         reminder_datetime = datetime.combine(
-            now.date(), 
-            datetime.strptime(time, "%H:%M").time()
+            now.date(),
+            datetime.strptime(t, "%H:%M").time()
         )
-
         scheduler.add_job(
             send_reminder,
             trigger=DateTrigger(run_date=reminder_datetime),
@@ -341,79 +519,15 @@ def save_reminder():
     return jsonify({"reply": 'success'})
 
 
-def generate_bot_response():
-    user_input = request.json.get("input", "")
-    
-    prompt = f"""You are a compassionate and knowledgeable mental health assistant. Your role is to listen to the user’s emotional concerns and 
-    provide supportive advice. Act as a friend or caretaker to the user. Use simple, everyday language to keep things easy to understand. Make 
-    sure your tone is conversational, and avoid technical terms or complex phrases. At the end ask a specific follow-up question related to their 
-    health or well-being. Keep your question friendly and focused on keeping the conversation going in a positive, engaging way. Provide the best 
-    course of action based on this input: {user_input}. Use strictly just 1-2 short sentences [max 50 words]"""
-
-    try:
-        result = chat_object.send_message(prompt)
-        print(result.text) 
-        bot_response = result.text
-        return jsonify({"reply": bot_response})
-    except Exception as error:
-        print("Error generating response:", error)
-        return jsonify({"error": "Error generating response"}), 500
-
 @app.route('/speed_bar')
 def speed_bar():
     return render_template('speed_bar.html')
 
-@app.route('/emotion_analysis_page')
-def emotion_analysis_page():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
-    return render_template('emotion_analysis.html')
 
-@app.route('/emotion_analysis', methods=['GET'])
-def get_emotion_analysis():
-    if 'user_id' not in session:
-        return jsonify({"error": "User not logged in"}), 401
-    try:
-        emotion_detector = EmotionDetector()
-        user_id = get_user_id()
-        chat_history = get_chat_history()
-        emotion_analysis = {
-            'emotion_counts': {},
-            'emotion_trends': [],
-            'overall_dominant_emotion': None
-        }
-        user_messages = [
-            msg for msg in chat_history 
-            if msg['role'] == 'user'
-        ][-20:]   # Only analyzes the last 20 user messages
-        
-        for message in user_messages:
-            text = message.get('content', '')
-            if text:
-                try:
-                    emotion, confidence = emotion_detector.detect_emotion(text)
-                    emotion_analysis['emotion_counts'][emotion] = emotion_analysis['emotion_counts'].get(emotion, 0) + 1
-                    emotion_analysis['emotion_trends'].append({
-                        'emotion': emotion,
-                        'confidence': confidence,
-                        'timestamp': message.get('timestamp')
-                    })
-                except Exception as emotion_error:
-                    print(f"Error detecting emotion for message: {text}")
-                    print(f"Error details: {emotion_error}")
-        
-        # Determining the overall dominant emotion based on counts
-        if emotion_analysis['emotion_counts']:
-            emotion_analysis['overall_dominant_emotion'] = max(
-                emotion_analysis['emotion_counts'], 
-                key=emotion_analysis['emotion_counts'].get
-            )
-        
-        return jsonify(emotion_analysis)
-    
-    except Exception as e:
-        print(f"Emotion Analysis Error: {e}")
-        return jsonify({"error": "Error processing emotion analysis"}), 500
+@app.route("/metrics")
+def prometheus_metrics():
+    return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+
 
 if __name__ == '__main__':
-    app.run(debug=True, port=3000)
+    app.run(debug=True, port=3000, use_reloader=False)
