@@ -1,4 +1,4 @@
-The repository of team 8's project for CS555, this team includes, Luo Xu, Annanya Jain, Aya Salama, Spurthi Setty, Yanran Jia and Divya Prahlad from Stevens Institute of Technology.
+Originally built by Team 8 (Luo Xu, Annanya Jain, Aya Salama, Spurthi Setty, Yanran Jia, and Divya Prahlad) for CS555 at Stevens Institute of Technology. This fork, maintained by Gavin Lam, extends the project by integrating a LangChain ReAct agent powered by Gemini 2.5 Flash, adding real-time web search for health information and per-user persistent conversation memory.
 
 This goal of this project is to create an AI voice chatbot that the user can interact with to talk about mental health problems and surface level physical health problems.
 
