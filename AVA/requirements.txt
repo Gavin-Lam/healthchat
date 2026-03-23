@@ -15,3 +15,7 @@ numpy
 scikit-learn
 nltk
 pandas
+langchain>=0.2.0
+langchain-google-genai>=1.0.0
+langchain-community>=0.2.0
+duckduckgo-search>=6.0.0
